@@ -214,7 +214,6 @@ else
   set @rowCount = RowCount(@rows)
 endif
 ]%%
-%%[ if @rowCount > 0 then ]%%
 
 <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" valign="top" style="padding-left:15px; padding-right:15px; padding-top:9px; padding-bottom:15x; font-size:16px; line-height:24px;"><div style="text-align:left; font-size:16px; line-height:24px; font-family:'Open Sans','Helvetica Neue',Helvetica,Arial,sans-serif; color:#230F33; font-weight:normal;">
   
@@ -242,7 +241,7 @@ for @i = 1 to @rowCount do
 </div>
 </td></tr></table>
 
-%%[ endif ]%%</td></tr></table><table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="min-width: 100%; " class="stylingblock-content-wrapper"><tr><td class="stylingblock-content-wrapper camarker-inner"><table align="center" border="0" cellpadding="0" cellspacing="0" class="em_wrapper" style="width:600px;" width="600">
+</td></tr></table><table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="min-width: 100%; " class="stylingblock-content-wrapper"><tr><td class="stylingblock-content-wrapper camarker-inner"><table align="center" border="0" cellpadding="0" cellspacing="0" class="em_wrapper" style="width:600px;" width="600">
 <tr><td align="center" valign="top" style="padding-top:20px; padding-bottom:20px;">
 
 
