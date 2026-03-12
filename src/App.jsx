@@ -338,8 +338,6 @@ const DEFAULTS = Object.fromEntries(
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  AMPscript evaluator
-//  FIX: strip "set @var = value" statements before evaluating conditions
-//       so they don't pollute the if-block content detection.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function ampCondition(cond, vars) {
@@ -358,7 +356,6 @@ function ampCondition(cond, vars) {
   m = cond.match(/^empty\((\w+)\)$/i);
   if (m) return !vars[m[1]] || vars[m[1]] === "";
 
-  // IndexOf(VAR,"STR") == 0 → AMPscript returns 0 when NOT found
   m = cond.match(/IndexOf\((\w+),\s*"([^"]*)"\)\s*==\s*0/i);
   if (m) return !String(vars[m[1]] ?? "").includes(m[2]);
 
@@ -377,50 +374,102 @@ function ampCondition(cond, vars) {
   return false;
 }
 
-// Strip inline AMPscript `set` statements from a condition string
-// e.g. "not empty(FOO) and FOO != "Bar" then\nset @cbrShows = "true"\n"
-// → "not empty(FOO) and FOO != "Bar""
 function stripSetStatements(condAndBody) {
   return condAndBody.replace(/\bset\s+@\w+\s*=\s*(?:"[^"]*"|'[^']*'|\S+)/gi, "").trim();
 }
 
 function processIfBlocks(html, vars) {
-  // Matches: %%[ if COND then ]%% ... %%[ endif ]%%
-  // The body between tags may contain elseif/else tags
-  const ifPat = /%%\[\s*if\s+([\s\S]+?)\s+then\s*\]%%([\s\S]*?)%%\[\s*endif\s*\]%%/gi;
-  let prev = html;
-  for (let i = 0; i < 15; i++) {
-    const next = prev.replace(ifPat, (_, rawCondStr, body) => {
-      // Strip any "set @var = ..." that leaked into condition or body preamble
-      const condStr = stripSetStatements(rawCondStr);
+  // 1. Normalizar múltiples "endif" juntos (ej. %%[ endif \n endif ]%%)
+  let str = html.replace(/%%\[(?:\s*endif\s*)+\]%%/gi, match => {
+    const count = (match.match(/endif/gi) || []).length;
+    return "%%[ endif ]%%\n".repeat(count);
+  });
 
-      const splitter = /%%\[\s*(elseif\s+[\s\S]+?\s+then|else)\s*\]%%/gi;
-      const parts = [];
-      let cur = condStr.trim(), last = 0, m;
-      splitter.lastIndex = 0;
-      while ((m = splitter.exec(body)) !== null) {
-        parts.push({ cond: cur, content: body.slice(last, m.index) });
-        const tag = m[1].trim();
-        cur = /^else$/i.test(tag) ? "__else__"
-              : stripSetStatements(
-                  tag.replace(/^elseif\s+/i, "").replace(/\s+then$/i, "").trim()
-                );
-        last = m.index + m[0].length;
-      }
-      parts.push({ cond: cur, content: body.slice(last) });
+  // 2. Tokenizar todo el código AMPscript (crear un árbol de nodos)
+  const tagRegex = /%%\[\s*(if\s+[\s\S]+?|elseif\s+[\s\S]+?|else|endif)\s*\]%%/gi;
+  let tokens = [];
+  let lastIdx = 0;
+  let match;
 
-      for (const p of parts) {
-        if (p.cond === "__else__" || ampCondition(p.cond, vars)) {
-          // Remove any remaining set statements from the chosen branch content
-          return p.content.replace(/%%\[\s*set\s+@\w+\s*=\s*(?:"[^"]*"|'[^']*'|\S+)\s*\]%%/gi, "");
-        }
-      }
-      return "";
-    });
-    if (next === prev) break;
-    prev = next;
+  while ((match = tagRegex.exec(str)) !== null) {
+    if (match.index > lastIdx) {
+      tokens.push({ type: 'text', val: str.slice(lastIdx, match.index) });
+    }
+    let content = match[1].trim();
+    if (/^if\s+/i.test(content)) {
+       tokens.push({ type: 'if', cond: content.replace(/^if\s+/i, '').replace(/\s+then$/i, '').trim() });
+    } else if (/^elseif\s+/i.test(content)) {
+       tokens.push({ type: 'elseif', cond: content.replace(/^elseif\s+/i, '').replace(/\s+then$/i, '').trim() });
+    } else if (/^else$/i.test(content)) {
+       tokens.push({ type: 'else' });
+    } else if (/^endif$/i.test(content)) {
+       tokens.push({ type: 'endif' });
+    }
+    lastIdx = tagRegex.lastIndex;
   }
-  return prev;
+  if (lastIdx < str.length) {
+    tokens.push({ type: 'text', val: str.slice(lastIdx) });
+  }
+
+  // 3. Función recursiva para evaluar exactamente la rama correcta
+  function evaluateTokens(tks) {
+     let result = "";
+     let i = 0;
+     while (i < tks.length) {
+        let t = tks[i];
+        if (t.type === 'text') {
+           result += t.val;
+           i++;
+        } else if (t.type === 'if') {
+           let depth = 1;
+           let blockTokens = [];
+           i++;
+           // Agrupar todo el bloque interno hasta su propio endif
+           while (i < tks.length && depth > 0) {
+              if (tks[i].type === 'if') depth++;
+              else if (tks[i].type === 'endif') depth--;
+              
+              if (depth > 0) blockTokens.push(tks[i]);
+              i++;
+           }
+           
+           // Separar el bloque en ramas lógicas
+           let branches = [];
+           let currentBranch = { cond: t.cond, tokens: [] };
+           let branchDepth = 0;
+           
+           for (let j = 0; j < blockTokens.length; j++) {
+              let bt = blockTokens[j];
+              if (bt.type === 'if') branchDepth++;
+              else if (bt.type === 'endif') branchDepth--;
+              
+              if (branchDepth === 0 && bt.type === 'elseif') {
+                 branches.push(currentBranch);
+                 currentBranch = { cond: bt.cond, tokens: [] };
+              } else if (branchDepth === 0 && bt.type === 'else') {
+                 branches.push(currentBranch);
+                 currentBranch = { cond: '__else__', tokens: [] };
+              } else {
+                 currentBranch.tokens.push(bt);
+              }
+           }
+           branches.push(currentBranch);
+
+           // Evaluar y quedarse solo con la primera rama que cumpla la condición
+           for (let b of branches) {
+              if (b.cond === '__else__' || ampCondition(b.cond, vars)) {
+                 result += evaluateTokens(b.tokens); // Llama la recursividad
+                 break;
+              }
+           }
+        } else {
+           i++; // Ignorar etiquetas huérfanas
+        }
+     }
+     return result;
+  }
+
+  return evaluateTokens(tokens);
 }
 
 function evaluateAmpscript(html, vars) {
@@ -463,40 +512,45 @@ function buildIframeDoc(vars) {
     "</" + "script>",
   ].join("\n");
 
-  // ── Previewer patch: fix CTA button centering ───────────────────────────
-  // The CTA structure is: <td align=center> > <div inline-block width:100%>
-  //   > <table align=center> > ... > <table bgcolor=#008A22>
-  // table align=center inside an inline-block+width:100% div renders left.
-  // Fix: set text-align:center on the outer <td> that wraps the div.
-  // That makes the inline-block div itself center inside it.
-  const ctaPatchScript = [
-    "<scr" + "ipt>",
-    "function patchCTAs(){",
-    "  document.querySelectorAll('td[bgcolor=\"#008A22\"]').forEach(function(td){",
-    "    var el = td.parentElement;",
-    "    while(el && el.tagName !== 'DIV') el = el.parentElement;",
-    "    if(el){",
-    "      var parentTd = el.parentElement;",
-    "      while(parentTd && parentTd.tagName !== 'TD') parentTd = parentTd.parentElement;",
-    "      if(parentTd) parentTd.style.textAlign = 'center';",
-    "      el.style.width = 'auto';",
-    "    }",
-    "  });",
-    "}",
-    "document.addEventListener('DOMContentLoaded', patchCTAs);",
-    "window.addEventListener('load', patchCTAs);",
-    "</" + "script>",
+  // ── PREVIEWER CSS FIX ────────────────────────────────────────────────────────
+  // The email structure is:
+  //   em_full_wrap (width=100%) > TD (align=center) >
+  //   em_main_table (width=600px fixed) > TD >
+  //   content tables (width=100%) > TD (padding-left:15px, padding-right:15px)
+  //
+  // In a real email client, table TDs use the classic box model: padding is
+  // ADDITIVE. So a TD that is 600px wide with 15px padding has 630px total
+  // footprint — but email clients clip this to the 600px column.
+  //
+  // In a browser iframe, the same TD is 600px content + 30px padding = 630px,
+  // and the inner table width=100% becomes 600px, which OVERFLOWS 30px to the right.
+  //
+  // Fix: apply overflow:hidden to the em_main_table's TD (the 600px column),
+  // which clips everything inside to 600px, matching real email client behavior.
+  const previewerCSS = [
+    "html,body{margin:0 !important;padding:0 !important;background:#ffffff;}",
+    "body{padding:12px 0 !important;}",
+    // Clip the 600px email column — this is the key fix
+    // Any content that overflows due to additive padding gets clipped, 
+    // just like real email clients do.
+    ".em_main_table > tbody > tr > td, .em_main_table > tr > td{overflow:hidden !important;}",
+    // Also clip the em_wrapper
+    ".em_wrapper > tbody > tr > td, .em_wrapper > tr > td{overflow:hidden !important;}",
+    // Fix inline-block CTA wrapper divs
+    "div[style*='inline-block']{display:block !important;width:100% !important;box-sizing:border-box !important;text-align:center !important;}",
+    // Restore explicit left-align on text content divs
+    "div[style*='text-align:left']{text-align:left !important;}",
+    "div[style*='text-align: left']{text-align:left !important;}",
   ].join("\n");
 
   return (
     "<!DOCTYPE html>" +
     "<html><head><meta charset=\"utf-8\">" +
     "<style>" +
-    "html,body{margin:0;padding:0;background:#ffffff;}" +
-    "body{padding:12px 0;box-sizing:border-box;}" +
+    previewerCSS +
     styles +
     "</style></head>" +
-    "<body>" + body + ctaPatchScript + heightScript + "</body>" +
+    "<body>" + body + heightScript + "</body>" +
     "</html>"
   );
 }
